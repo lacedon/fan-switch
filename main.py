@@ -1,200 +1,168 @@
-# fan-switch: 433 MHz remote -> two events, for Raspberry Pi Pico (MicroPython).
-#
-# The receiver's DATA pin is sampled with an edge interrupt; frames are decoded
-# with the same protocol table as the Arduino rc-switch library (covers EV1527,
-# PT2262, HT6P20B and most cheap 433 MHz remotes).
-
-import time
-from array import array
 from machine import Pin
+import time
 
-# ---------------------------------------------------------------- config ----
+RX_PIN = 22
+BUTTON_PINS = (16, 17)  # wired to GND, internal pull-up (pressed = 0)
+RECORD_PIN = 18         # held together with one of BUTTON_PINS = record; alone = send
+TX_PIN = 21
+TX_REPEATS = 8          # remotes repeat the frame while a key is pressed
+TX_GAP_US = 10000       # low time between repeats
+BUF_SIZE = 512          # max edges buffered between main loop passes
+GAP_US = 4000           # a pulse longer than this ends a frame (sync/idle gap)
+MIN_PULSES = 24         # shorter frames are treated as noise
+MIN_PULSE_US = 80       # shorter pulses are treated as glitches
 
-RX_PIN = 22          # receiver DATA
-LED_PIN = "LED"      # onboard LED, blinks on every recognized press
+rx = Pin(RX_PIN, Pin.IN)
+buttons = [Pin(p, Pin.IN, Pin.PULL_UP) for p in BUTTON_PINS]
+record_button = Pin(RECORD_PIN, Pin.IN, Pin.PULL_UP)
+tx = Pin(TX_PIN, Pin.OUT, value=0)
 
-# Output events. mode "pulse": pin goes high for pulse_ms on each press.
-#                mode "toggle": pin flips state on each press.
-EVENTS = {
-    1: {"pin": 16, "mode": "pulse", "pulse_ms": 300},
-    2: {"pin": 17, "mode": "pulse", "pulse_ms": 300},
-}
+# saved[0] is the frame caught while button 1 (GP16) and the record button (GP18)
+# were held, saved[1] the one for button 2 (GP17) and the record button
+saved = [None, None]
 
-# Remote button code -> events to fire. Press a button with the REPL open to
-# see its code. Any number of remotes/buttons can be listed here, and a button
-# can fire both events, e.g.  0x123456: (1, 2),
-CODES = {
-    # 0xA1B2C1: (1,),
-    # 0xA1B2C2: (2,),
-}
-
-CONFIRM_FRAMES = 2   # identical frames needed before a press counts (noise filter)
-RELEASE_MS = 250     # silence after which the button is considered released
-TOLERANCE = 60       # pulse length tolerance, percent
-
-
-def on_event(event):
-    """Called for every fired event; put custom actions here."""
-    print("Event", event)
-
-
-# ------------------------------------------------------------- receiver ----
-
-# rc-switch protocols: (pulse_us, sync, zero, one, inverted)
-# Protocol 4's sync gap is shorter than _SEPARATOR_US, so (as in rc-switch) it
-# is listed only to keep the numbering.
-PROTOCOLS = (
-    (350, (1, 31), (1, 3), (3, 1), False),
-    (650, (1, 10), (1, 2), (2, 1), False),
-    (100, (30, 71), (4, 11), (9, 6), False),
-    (380, (1, 6), (1, 3), (3, 1), False),
-    (500, (6, 14), (1, 2), (2, 1), False),
-    (450, (23, 1), (1, 2), (2, 1), True),
-    (150, (2, 62), (1, 6), (6, 1), False),
-)
-
-_MAX_CHANGES = 67    # 32 bits * 2 edges + separator + sync
-_SEPARATOR_US = 4300 # gaps longer than this end a frame
-
-_timings = array("I", [0] * _MAX_CHANGES)
-_frame = array("I", [0] * _MAX_CHANGES)
-_frame_len = 0
-_frame_ready = False
-_count = 0
-_last_edge = 0
+buf = [0] * BUF_SIZE  # pulse durations in us
+head = 0
+tail = 0
+last_edge = time.ticks_us()
+dropped = 0
+edges = 0
+seen = []  # every pulse read this session, for debugging
+cur = []  # frame being assembled across next_frame() calls
 
 
-def _on_edge(pin):
-    # Hard IRQ: no allocation allowed, keep it short.
-    global _timings, _frame, _frame_len, _frame_ready, _count, _last_edge
+def on_edge(pin):
+    global head, last_edge, dropped, edges
+    edges += 1
     now = time.ticks_us()
-    duration = time.ticks_diff(now, _last_edge)
-    _last_edge = now
-
-    if duration > _SEPARATOR_US:
-        # A separator closes the frame collected since the previous one.
-        if _count > 7 and not _frame_ready:
-            _timings, _frame = _frame, _timings
-            _frame_len = _count
-            _frame_ready = True
-        _count = 0
-
-    if _count >= _MAX_CHANGES:
-        _count = 0
-    _timings[_count] = duration
-    _count += 1
+    dur = time.ticks_diff(now, last_edge)
+    last_edge = now
+    nxt = (head + 1) % BUF_SIZE
+    if nxt == tail:
+        dropped += 1
+        return
+    buf[head] = dur
+    head = nxt
 
 
-def decode(timings, n, protocol):
-    """Decode n timings (timings[0] = leading separator). Returns (code, bits) or None."""
-    _, sync, zero, one, inverted = protocol
-    delay = timings[0] // (sync[0] if inverted else sync[1])
-    if delay == 0:
-        return None
-    tol = delay * TOLERANCE // 100
-    zero_hi, zero_lo = delay * zero[0], delay * zero[1]
-    one_hi, one_lo = delay * one[0], delay * one[1]
-
-    code = 0
-    bits = 0
-    for i in range(2 if inverted else 1, n - 1, 2):
-        hi, lo = timings[i], timings[i + 1]
-        code <<= 1
-        if abs(hi - zero_hi) < tol and abs(lo - zero_lo) < tol:
-            pass
-        elif abs(hi - one_hi) < tol and abs(lo - one_lo) < tol:
-            code |= 1
-        else:
-            return None
-        bits += 1
-    if bits < 4:
-        return None
-    return code, bits
+def start_listening():
+    global head, tail, last_edge, dropped, edges, cur, seen
+    seen = []
+    head = tail = 0
+    dropped = 0
+    edges = 0
+    cur = []
+    last_edge = time.ticks_us()
+    rx.irq(trigger=Pin.IRQ_RISING | Pin.IRQ_FALLING, handler=on_edge)
 
 
-def read_frame():
-    """Return (code, bits, protocol_number) for a newly received frame, or None."""
-    global _frame_ready
-    if not _frame_ready:
-        return None
-    result = None
-    for number, protocol in enumerate(PROTOCOLS, 1):
-        decoded = decode(_frame, _frame_len, protocol)
-        if decoded:
-            result = decoded + (number,)
-            break
-    _frame_ready = False
-    return result
+def stop_listening():
+    rx.irq(handler=None)
 
 
-# --------------------------------------------------------------- outputs ----
-
-class Output:
-    def __init__(self, pin, mode="pulse", pulse_ms=300):
-        self.pin = Pin(pin, Pin.OUT, value=0)
-        self.mode = mode
-        self.pulse_ms = pulse_ms
-        self.off_at = None
-
-    def fire(self):
-        if self.mode == "toggle":
-            self.pin.toggle()
-        else:
-            self.pin.value(1)
-            self.off_at = time.ticks_add(time.ticks_ms(), self.pulse_ms)
-
-    def update(self, now):
-        if self.off_at is not None and time.ticks_diff(now, self.off_at) >= 0:
-            self.pin.value(0)
-            self.off_at = None
+def decode(pulses):
+    """Guess bits from (high, low) pairs: longer high = 1, longer low = 0."""
+    bits = ""
+    for i in range(0, len(pulses) - 1, 2):
+        bits += "1" if pulses[i] > pulses[i + 1] else "0"
+    value = int(bits, 2) if bits else 0
+    return bits, value
 
 
-# ------------------------------------------------------------------ main ----
+def report(frame):
+    print("frame: %d pulses, min=%dus max=%dus" % (len(frame), min(frame), max(frame)))
+    print("  raw:", frame)
+    bits, value = decode(frame)
+    print("  bits(%d): %s  hex=0x%X" % (len(bits), bits, value))
+
+
+def next_frame():
+    """Return the next complete frame from the buffer, or None if there isn't one yet."""
+    global tail, cur
+    while tail != head:
+        dur = buf[tail]
+        tail = (tail + 1) % BUF_SIZE
+        if len(seen) < 300:
+            seen.append(dur)
+        if dur >= GAP_US:
+            frame, cur = cur, []
+            if len(frame) >= MIN_PULSES:
+                return frame
+        elif dur >= MIN_PULSE_US:
+            cur.append(dur)
+            if len(cur) > BUF_SIZE:
+                cur = []
+    return None
+
+
+def pressed_index():
+    for i, b in enumerate(buttons):
+        if b.value() == 0:
+            return i
+    return None
+
+
+def capture(index):
+    """Listen while button `index` and the record button are held; save the first frame caught."""
+    print("button %d + record pressed, listening..." % (index + 1))
+    start_listening()
+    caught = False
+    while buttons[index].value() == 0 and record_button.value() == 0:
+        if not caught:
+            frame = next_frame()
+            if frame:
+                saved[index] = frame
+                caught = True
+                stop_listening()
+                print("saved[%d] =" % index)
+                report(frame)
+        time.sleep_ms(5)
+    stop_listening()
+    if dropped:
+        print("warning: buffer overflow, dropped edges:", dropped)
+    if not caught:
+        print("button %d released, nothing caught (%d edges seen)" % (index + 1, edges))
+        print("  pulses (us):", seen)
+    time.sleep_ms(50)  # debounce
+
+
+def wait_us(us):
+    start = time.ticks_us()
+    while time.ticks_diff(time.ticks_us(), start) < us:
+        pass
+
+
+def send(index):
+    """Replay saved[index] on the transmitter while the button is held."""
+    frame = saved[index]
+    if frame is None:
+        print("button %d: nothing saved yet" % (index + 1))
+        return
+    print("button %d pressed, sending saved[%d] x%d" % (index + 1, index, TX_REPEATS))
+    for _ in range(TX_REPEATS):
+        level = 1
+        for dur in frame:
+            tx.value(level)
+            wait_us(dur)
+            level ^= 1
+        tx.value(0)
+        wait_us(TX_GAP_US)
+
 
 def main():
-    outputs = {event: Output(**cfg) for event, cfg in EVENTS.items()}
-    led = Output(LED_PIN, "pulse", 100)
-
-    rx = Pin(RX_PIN, Pin.IN)
-    rx.irq(trigger=Pin.IRQ_RISING | Pin.IRQ_FALLING, handler=_on_edge, hard=True)
-    print("fan-switch listening on GP%d" % RX_PIN)
-
-    current = None   # code of the button being held
-    seen = 0         # frames received for it
-    last_seen = 0
-
+    print("Hold GP%d + (GP%d or GP%d) to record from GP%d; GP%d or GP%d alone sends on GP%d" % (RECORD_PIN, BUTTON_PINS[0], BUTTON_PINS[1], RX_PIN, BUTTON_PINS[0], BUTTON_PINS[1], TX_PIN))
     while True:
-        now = time.ticks_ms()
-        frame = read_frame()
-
-        if frame:
-            code, bits, protocol = frame
-            if code == current:
-                seen += 1
+        index = pressed_index()
+        if index is not None:
+            time.sleep_ms(50)  # let GP18 settle when both are pressed together
+            if record_button.value() == 0:
+                capture(index)
             else:
-                current, seen = code, 1
-            last_seen = now
-
-            # Fire once per press; remotes repeat the frame while held.
-            if seen == CONFIRM_FRAMES:
-                led.fire()
-                events = CODES.get(code)
-                if events:
-                    for event in events:
-                        outputs[event].fire()
-                        on_event(event)
-                else:
-                    print("Unknown code 0x%X (%d bits, protocol %d) - add to CODES:"
-                          % (code, bits, protocol))
-                    print("    0x%X: (1,)," % code)
-
-        elif current is not None and time.ticks_diff(now, last_seen) > RELEASE_MS:
-            current = None
-
-        for output in outputs.values():
-            output.update(now)
-        led.update(now)
-        time.sleep_ms(1)
+                send(index)
+                while buttons[index].value() == 0:  # send once per press
+                    time.sleep_ms(10)
+                time.sleep_ms(50)  # debounce
+        time.sleep_ms(10)
 
 
 main()

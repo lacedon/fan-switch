@@ -1,37 +1,33 @@
 # fan-switch
-A small project for Raspberry Pi Pico and 433mhz Transmitter
 
-The Pico listens to 433 MHz remotes and fires **event 1** or **event 2**
-depending on which button was pressed. Any number of remotes can be mapped,
-and one button can fire both events.
+MicroPython script for a Raspberry Pi Pico that learns and replays the radio signal of a fan remote. It records a raw pulse train from a receiver module and plays it back through a transmitter module, so two buttons on the Pico can stand in for two buttons on the original remote.
 
 ## Wiring
 
-| Receiver | Pico                                   |
-|----------|----------------------------------------|
-| VCC      | 3V3 (pin 36), or VBUS (pin 40) if 5 V-only |
-| GND      | GND                                    |
-| DATA     | GP22 (pin 29)                          |
+| Pin  | Role                                                                 |
+|------|----------------------------------------------------------------------|
+| GP22 | RF receiver data in (`RX_PIN`)                                       |
+| GP21 | RF transmitter data out (`TX_PIN`)                                   |
+| GP16 | Button 1 (to GND, internal pull-up)                                  |
+| GP17 | Button 2 (to GND, internal pull-up)                                  |
+| GP18 | Record button (to GND, internal pull-up)                             |
 
-- Pico GPIOs are **not 5 V tolerant**. Modules like RXB6 / SRX882 run fine at
-  3.3 V. If yours needs 5 V (e.g. MX-RM-5V / XY-MK-5V), put a divider on DATA
-  (10 kΩ in series, 20 kΩ to GND).
-- Solder a 17.3 cm wire to the ANT pad for decent range.
-- Event outputs: GP16 (event 1) and GP17 (event 2). The onboard LED blinks on
-  every recognized press.
+## Usage
 
-## Setup
+- **Record:** hold GP18 together with GP16 or GP17, then press the key on the original remote. The first complete frame caught is stored in the slot for that button. Release the buttons to finish.
+- **Send:** press GP16 or GP17 alone. The saved frame for that button is transmitted, repeated `TX_REPEATS` times (the way real remotes repeat while a key is held). It sends once per press.
 
-1. Flash MicroPython onto the Pico (hold BOOTSEL, plug in, drop the `.uf2`).
-2. Copy `main.py` to the Pico, e.g. `mpremote cp main.py :main.py`.
-3. Open the REPL (`mpremote` or Thonny) and press each remote button. Unknown
-   codes are printed:
-   ```
-   Unknown code 0xA1B2C1 (24 bits, protocol 1) - add to CODES:
-       0xA1B2C1: (1,),
-   ```
-4. Add the codes to `CODES` in `main.py` with the event(s) they should fire,
-   copy the file again and reset the Pico.
+Saved frames are kept in RAM only, so they are lost on reset and you need to record them again.
 
-Each event can `pulse` its pin (for `pulse_ms`) or `toggle` it on every press;
-see `EVENTS` in `main.py`.
+## How it works
+
+1. **Capture:** while recording, an interrupt on every rising and falling edge of the receiver pin stores the time since the previous edge in a ring buffer (`on_edge`).
+2. **Framing:** `next_frame()` drains the buffer. Pulses shorter than `MIN_PULSE_US` are dropped as glitches. A pulse longer than `GAP_US` is treated as the gap between frames and closes the current frame. Frames with fewer than `MIN_PULSES` pulses are discarded as noise.
+3. **Report:** a caught frame is printed over serial as raw durations, plus a best-guess bit string and hex value (`decode`, where a longer high than low means 1). This is only for debugging, and replay uses the raw durations.
+4. **Replay:** `send()` toggles the TX pin, starting high, and holds each level for the recorded duration. It waits `TX_GAP_US` between repeats.
+
+The tunable constants (`TX_REPEATS`, `TX_GAP_US`, `GAP_US`, `MIN_PULSES`, `MIN_PULSE_US`, `BUF_SIZE`) are at the top of [main.py](main.py).
+
+## Upload
+
+Copy `main.py` to the board with `mpremote`, for example `mpremote cp main.py :main.py + reset`.
